@@ -20,6 +20,8 @@ defmodule BorsNG.Database.Batch do
     field(:last_polled, :integer)
     field(:timeout_at, :integer)
     field(:priority, :integer, default: 0)
+    field(:parent_commit, :string)
+    field(:parent_batch_id, :integer)
     has_many(:patches, LinkPatchBatch)
     timestamps()
   end
@@ -32,7 +34,23 @@ defmodule BorsNG.Database.Batch do
       commit: nil,
       state: :waiting,
       last_polled: DateTime.to_unix(DateTime.utc_now(), :second),
-      priority: priority
+      priority: priority,
+      parent_commit: nil,
+      parent_batch_id: nil
+    }
+  end
+
+  @spec new_with_parent(Project.id(), String.t(), non_neg_integer, String.t(), non_neg_integer) :: t
+  def new_with_parent(project_id, into_branch, priority, parent_commit, parent_batch_id) do
+    %Batch{
+      into_branch: into_branch,
+      project_id: project_id,
+      commit: nil,
+      state: :waiting,
+      last_polled: DateTime.to_unix(DateTime.utc_now(), :second),
+      priority: priority,
+      parent_commit: parent_commit,
+      parent_batch_id: parent_batch_id
     }
   end
 
@@ -177,7 +195,9 @@ defmodule BorsNG.Database.Batch do
       :state,
       :last_polled,
       :timeout_at,
-      :priority
+      :priority,
+      :parent_commit,
+      :parent_batch_id
     ])
   end
 
