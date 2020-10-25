@@ -243,15 +243,20 @@ defmodule BorsNG.WebhookController do
     staging_branch = project.staging_branch
     trying_branch = project.trying_branch
 
-    case {action, branch} do
-      {"completed", ^staging_branch} ->
-        Batch
-        |> Repo.get_by!(commit: sha, project_id: project.id)
-        |> Batch.changeset(%{last_polled: 0})
-        |> Repo.update!()
+    # Mutlibors: regex matching to see if it was a staging branch
+    # TODO: support a configurable prefix
+    if action == "completed" and String.match?(branch, ~r/^staging.\d+$/) do
+      Batch
+      |> Repo.get_by!(commit: sha, project_id: project.id)
+      |> Batch.changeset(%{last_polled: 0})
+      |> Repo.update!()
 
-        batcher = Batcher.Registry.get(project.id)
-        Batcher.poll(batcher)
+      batcher = Batcher.Registry.get(project.id)
+      Batcher.poll(batcher)
+    end
+    case {action, branch} do
+      # Multibors: removed as handled above now
+      #{"completed", ^staging_branch} ->
 
       {"completed", ^trying_branch} ->
         attemptor = Attemptor.Registry.get(project.id)

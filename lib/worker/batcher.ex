@@ -196,10 +196,11 @@ defmodule BorsNG.Worker.Batcher do
   end
 
   def do_handle_cast({:cancel, patch_id}, _project_id) do
+    # Multibors: Cancel all batches that include a PR
     patch_id
     |> Batch.all_for_patch(:incomplete)
-    |> Repo.one()
-    |> cancel_patch(patch_id)
+    |> Repo.all()
+    |> Enum.each(fn b -> cancel_patch(b,patch_id) end)
   end
 
   def do_handle_cast({:cancel_all}, project_id) do
@@ -281,18 +282,46 @@ defmodule BorsNG.Worker.Batcher do
 
   # Private implementation details
 
+  # Multibors: resolution of a parent batch's commit
+  defp resolve_parent_batch(batch) do
+    parent_batch = Repo.get(Batch, batch.parent_batch_id)
+    if parent_batch.commit != nil do
+      batch
+      |> Batch.changeset(%{parent_commit: parent_batch.commit})
+      |> Repo.update!()
+    end
+  end
+
+  defp resolve_parent_batches(project_id) do
+    project_id
+    |> Batch.all_for_project(:waiting)
+    |> Repo.all()
+    |> Enum.filter(fn b -> b.parent_commit == nil and b.parent_batch_id != nil end)
+    |> Enum.each(&resolve_parent_batch/1)
+  end
+
   defp poll_(project_id) do
     project = Repo.get(Project, project_id)
 
-    incomplete =
+    resolve_parent_batches(project_id)
+
+    incomplete_raw =
       project_id
       |> Batch.all_for_project(:incomplete)
       |> Repo.all()
 
-    incomplete
-    |> Enum.map(&%Batch{&1 | project: project})
-    |> sort_batches()
-    |> poll_batches()
+    # Multibors: if there are any batches, start them before polling the
+    # running batches.
+    # TODO: we probably want to poll both the waiting and running on each poll
+    incomplete = Enum.map(incomplete_raw, &%Batch{&1 | project: project})
+    if Enum.any?(incomplete, fn batch -> :waiting == batch.state end) do
+      waiting_incomplete = Enum.filter(incomplete, fn batch -> :waiting == batch.state end)
+      poll_batches({:waiting, waiting_incomplete})
+    else
+      incomplete
+      |> sort_batches()
+      |> poll_batches()
+    end
 
     if Enum.empty?(incomplete) do
       :stop
@@ -305,12 +334,17 @@ defmodule BorsNG.Worker.Batcher do
     project = Repo.get!(Project, patch.project_id)
     repo_conn = get_repo_conn(project)
 
+    # Multibors: clone existing batches
+    running_batches = running_batches(patch.project_id)
+
+    Enum.each(running_batches, fn x -> clone_batch_and_add_patch(x, patch.id, reviewer) end)
+
     {batch, is_new_batch} =
       get_new_batch(
         patch.project_id,
         patch.into_branch,
         patch.priority,
-        patch.is_single
+        true
       )
 
     %LinkPatchBatch{}
@@ -321,8 +355,10 @@ defmodule BorsNG.Worker.Batcher do
     })
     |> Repo.insert!()
 
+    # Multibors: this is to pause any if a higher priority comes in
+    # For now, multibors won't support priority, so don't do this
     if is_new_batch do
-      put_incomplete_on_hold(repo_conn, batch)
+      #put_incomplete_on_hold(repo_conn, batch)
     end
 
     poll_after_delay(project)
@@ -356,10 +392,14 @@ defmodule BorsNG.Worker.Batcher do
   end
 
   defp poll_batches({:waiting, batches}) do
-    case Enum.filter(batches, &Batch.next_poll_is_past/1) do
-      [] -> :ok
-      [batch | _] -> start_waiting_batch(batch)
-    end
+    # Multibors: start all waiting batches that are in a valid state
+    #case Enum.filter(batches, &Batch.next_poll_is_past/1) do
+    #  [] -> :ok
+    #  [batch | _] -> start_waiting_batch(batch)
+    #end
+
+    Enum.each(Enum.filter(batches, fn b -> b.parent_batch_id == nil end), fn b -> start_waiting_batch(b) end)
+    Enum.each(Enum.filter(batches, fn b -> b.parent_batch_id != nil and b.parent_commit != nil end), fn b -> start_waiting_batch(b) end)
   end
 
   defp poll_batches({:running, batches}) do
@@ -544,7 +584,16 @@ defmodule BorsNG.Worker.Batcher do
             GitHub.delete_branch!(repo_conn, stmp)
             [new_head]
           else
-            parents = [base.commit | Enum.map(patch_links, & &1.patch.commit)]
+            # Multibors: If this batch has a parent batch, use that as the
+            # parent for the merge commit
+            last_patch_link = List.last(patch_links)
+            base_commit =
+              if batch.parent_commit == nil do
+                base.commit
+              else
+                batch.parent_commit
+            end
+            parents = [base_commit, last_patch_link.patch.commit]
             parents
           end
 
@@ -558,6 +607,7 @@ defmodule BorsNG.Worker.Batcher do
           else
             commit_message =
               Batcher.Message.generate_commit_message(
+                batch.id,
                 patch_links,
                 toml.cut_body_after,
                 gather_co_authors(batch, patch_links)
@@ -566,7 +616,7 @@ defmodule BorsNG.Worker.Batcher do
             GitHub.synthesize_commit!(
               repo_conn,
               %{
-                branch: batch.project.staging_branch,
+                branch: batch.project.staging_branch <> "." <> to_string(batch.id),
                 tree: tree,
                 parents: parents,
                 commit_message: commit_message,
@@ -673,8 +723,9 @@ defmodule BorsNG.Worker.Batcher do
     project = batch.project
     repo_conn = get_repo_conn(project)
 
+    # Multibors: use staging branch with batch id
     {_, toml} =
-      case Batcher.GetBorsToml.get(repo_conn, "#{batch.project.staging_branch}") do
+      case Batcher.GetBorsToml.get(repo_conn, "#{batch.project.staging_branch}.#{batch.id}") do
         {:error, :fetch_failed} ->
           Batcher.GetBorsToml.get(repo_conn, "#{batch.project.staging_branch}.tmp")
 
@@ -735,8 +786,11 @@ defmodule BorsNG.Worker.Batcher do
           |> LinkPatchBatch.from_batch()
           |> Repo.all()
 
-        Divider.clone_batch(patch_links, project.id, batch.into_branch)
-        poll_after_delay(project)
+        # Multibors: disable auto-retry for now
+        # To support auto-retry, we first need to discard failures due to 'obsolete' PRs
+        # and probably fix some other things
+        #Divider.clone_batch(patch_links, project.id, batch.into_branch)
+        #poll_after_delay(project)
 
         # send appropriate message to failed patches
         send_message(repo_conn, patches, {:push_failed_non_ff, batch.into_branch})
@@ -755,12 +809,18 @@ defmodule BorsNG.Worker.Batcher do
       |> LinkPatchBatch.from_batch()
       |> Repo.all()
 
+    # Multibors: Splitting batches doesn't make sense for multi-bors
+    # Instead just mark them as failed
+    # TODO: We don't want to mark all patches as failed, instead
+    # TODO: we need to work out which if any are no longer being built
+    # TODO: anywhere and only notify failure for those.
     patches = Enum.map(patch_links, & &1.patch)
-    state = Divider.split_batch(patch_links, batch)
+    #state = Divider.split_batch(patch_links, batch)
+    state = :failed
 
-    if state == :retrying do
-      poll_after_delay(project)
-    end
+    #if state == :retrying do
+    #  poll_after_delay(project)
+    #end
 
     send_message(repo_conn, patches, {state, erred})
 
@@ -1088,6 +1148,39 @@ defmodule BorsNG.Worker.Batcher do
       [batch] -> {batch, false}
       _ -> get_new_batch(project_id, into_branch, priority, true)
     end
+  end
+
+  # Multibors: get all waiting or running batches
+  def running_batches(project_id) do
+    Batch
+    |> where([b], b.project_id == ^project_id)
+    |> where([b], b.state == ^:waiting or b.state == ^:running)
+    |> Repo.all()
+  end
+
+  # Multibors: clone a LinkPatchBatch entity
+  def clone_link_patch_batch(l, new_id) do
+    %LinkPatchBatch{}
+    |> LinkPatchBatch.changeset(%{
+      batch_id: new_id,
+      patch_id: l.patch_id,
+      reviewer: l.reviewer
+    })
+    |> Repo.insert!()
+  end
+
+  # Multibors: clone a batch and its patches
+  def clone_batch_and_add_patch(batch, patch_id, reviewer) do
+    cloned_batch = Repo.insert!(Batch.new_with_parent(batch.project_id, batch.into_branch, batch.priority, batch.commit, batch.id))
+    Repo.all(LinkPatchBatch.from_batch(batch.id))
+    |> Enum.each(fn l -> clone_link_patch_batch(l, cloned_batch.id) end)
+    %LinkPatchBatch{}
+    |> LinkPatchBatch.changeset(%{
+      batch_id: cloned_batch.id,
+      patch_id: patch_id,
+      reviewer: reviewer
+    })
+    |> Repo.insert!()
   end
 
   defp raise_batch_priority(%Batch{priority: old_priority} = batch, priority)

@@ -153,7 +153,8 @@ defmodule BorsNG.Worker.Batcher.Message do
     "#{pr.title} (##{pr.number})\n\n#{message_body}\n\n#{co_authors}\n"
   end
 
-  def generate_commit_message(patch_links, cut_body_after, co_authors) do
+  def generate_commit_message(batch_id, all_patch_links, cut_body_after, co_authors) do
+    patch_links = [List.last(all_patch_links)]
     commit_title = Enum.reduce(patch_links, "Merge", &"#{&2} \##{&1.patch.pr_xref}")
 
     commit_body =
@@ -183,7 +184,10 @@ defmodule BorsNG.Worker.Batcher.Message do
       |> Enum.map(&"Co-authored-by: #{&1}")
       |> Enum.join("\n")
 
-    "#{commit_title}\n#{commit_body}\n#{co_author_trailers}\n"
+    not_on_master = Enum.reduce(all_patch_links, "", &"#{&2} \##{&1.patch.pr_xref}")
+    batch_info = "Batch #{batch_id}. PRs not on master: (#{not_on_master}})"
+
+    "#{commit_title}\n#{commit_body}\n#{co_author_trailers}\n#{batch_info}\n"
   end
 
   def cut_body(nil, _), do: ""
